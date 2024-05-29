@@ -3,10 +3,10 @@
 #include <string.h>
 #include <stdbool.h>
 
-#define TAMANHO_QUADRO 256        // Tamanho do quadro
-#define NUMERO_QUADROS 128        // Número total de quadros na memória física
-#define TAMANHO_TLB 16            // Tamanho da TLB
-#define TAMANHO_TABELA_PAGINAS 256 // Tamanho da tabela de páginas
+#define TAMANHO_QUADRO 256
+#define NUMERO_QUADROS 128
+#define TAMANHO_TLB 16
+#define TAMANHO_TABELA_PAGINAS 256
 
 int tabelaPaginas[TAMANHO_TABELA_PAGINAS];
 int TLBPaginas[TAMANHO_TLB];
@@ -103,7 +103,8 @@ void obterPagina(int enderecoLogico) {
         indiceTLB = totalEntradasTLB - 1;
     }
 
-    valorLido = memoriaFisica[numeroQuadro][deslocamento];
+    fseek(arquivoArmazenamento, enderecoLogico, SEEK_SET);
+    fread(&valorLido, sizeof(signed char), 1, arquivoArmazenamento);
 
     contadorGlobalTempo++;
     tempoQuadros[numeroQuadro] = contadorGlobalTempo;
@@ -217,8 +218,8 @@ int main(int argc, char *argv[]) {
     }
 
     fprintf(arquivoSaida, "Number of Translated Addresses = %d\n", totalEnderecosTraduzidos);
-    double taxaFaltasPagina = (double) totalFaltasPagina / totalEnderecosTraduzidos;
-    double taxaAcertosTLB = (double) totalAcertosTLB / totalEnderecosTraduzidos;
+    double taxaFaltasPagina = (float) totalFaltasPagina / (float)totalEnderecosTraduzidos;
+    double taxaAcertosTLB = (float) totalAcertosTLB / (float)totalEnderecosTraduzidos;
 
     fprintf(arquivoSaida, "Page Faults = %d\n", totalFaltasPagina);
     fprintf(arquivoSaida, "Page Fault Rate = %.3f\n", taxaFaltasPagina);
