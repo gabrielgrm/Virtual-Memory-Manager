@@ -3,194 +3,231 @@
 #include <string.h>
 #include <stdbool.h>
 
-#define MEMORY_SIZE 128 * 256
-#define PAGE_SIZE 256
-#define TLB_SIZE 16
-#define PAGE_TABLE_SIZE 128
+#define TAMANHO_QUADRO 256        // Tamanho do quadro
+#define NUMERO_QUADROS 128        // Número total de quadros na memória física
+#define TAMANHO_TLB 16            // Tamanho da TLB
+#define TAMANHO_TABELA_PAGINAS 256 // Tamanho da tabela de páginas
 
-typedef struct TLB_entry {
-    int page_number;
-    int frame_number;
-} TLB_entry;
+int tabelaPaginas[TAMANHO_TABELA_PAGINAS];
+int TLBPaginas[TAMANHO_TLB];
+int TLBQuadros[TAMANHO_TLB];
+int tempoQuadros[NUMERO_QUADROS];
+int memoriaFisica[NUMERO_QUADROS][TAMANHO_QUADRO];
+int valorpaginas[5000];
 
-typedef struct Page_table_entry {
-    int page_number;
-    int frame_number;
-    struct Page_table_entry* next;
-} Page_table_entry;
+int totalFaltasPagina = 0;
+int totalAcertosTLB = 0;
+int proximoQuadroDisponivel = 0;
+int totalEntradasTLB = 0;
+int contadorGlobalTempo = 0;
+int primeiroNumeroTabelaPaginasDisponivel = 0;
+bool usarLRU = false, usarFIFO = false;
 
-TLB_entry tlb[TLB_SIZE];
-Page_table_entry* page_table = NULL;
+#define TAMANHO_ENDERECO 12
+#define TAMANHO_PAGINA 256
 
-signed char memory[MEMORY_SIZE];
-int next_free_frame = 0;
-int tlb_size = 0;
+FILE *arquivoEnderecos;
+FILE *arquivoArmazenamento;
+FILE *arquivoSaida;
 
-int page_fault_count = 0;
-int tlb_hit_count = 0;
-int total_addresses = 0;
+char enderecoStr[TAMANHO_ENDERECO];
+int enderecoLogico;
+signed char bufferArmazenamento[TAMANHO_PAGINA];
+signed char valorLido;
 
-int tlb_index = 0;
+void obterPagina(int endereco);
+void tratarFaltaPaginaLRU(int numeroPagina);
+void tratarFaltaPaginaFIFO(int numeroPagina);
+void inserirNaTLB(int numeroPagina, int numeroQuadro);
+int encontrarQuadroLRU(int tempos[], int tamanho);
 
-FILE *backing_store;
+int encontrarQuadroLRU(int tempos[], int tamanho) {
+    int minimo = 9999, posicao = 0;
 
-typedef struct FrameQueueNode {
-    int frame_number;
-    struct FrameQueueNode* next;
-} FrameQueueNode;
-
-FrameQueueNode* frame_queue_front = NULL;
-FrameQueueNode* frame_queue_rear = NULL;
-int frame_queue_size = 0;
-
-void initialize() {
-    for (int i = 0; i < TLB_SIZE; i++) {
-        tlb[i].page_number = -1; // Inicializa as entradas do TLB como inválidas
-    }
-    page_table = NULL;
-    memset(memory, 0, MEMORY_SIZE);
-}
-
-int search_tlb(int page_number) {
-    for (int i = 0; i < TLB_SIZE; i++) {
-        if (tlb[i].page_number == page_number) {
-            tlb_hit_count++;
-            return i;
+    for (int i = 0; i < tamanho; i++) {
+        if (tempos[i] < minimo) {
+            minimo = tempos[i];
+            posicao = i;
         }
     }
-    return -1;
+
+    return posicao;
 }
 
-void add_to_tlb(int page_number, int frame_number) {
-    tlb[tlb_index].page_number = page_number;
-    tlb[tlb_index].frame_number = frame_number;
-    tlb_index = (tlb_index + 1) % TLB_SIZE;
+void inicializarEstruturas() {
+    for (int i = 0; i < TAMANHO_TABELA_PAGINAS; i++) {
+        tabelaPaginas[i] = -1;
+    }
+
+    for (int i = 0; i < TAMANHO_TLB; i++) {
+        TLBPaginas[i] = -1;
+        TLBQuadros[i] = -1;
+    }
 }
 
-Page_table_entry* search_page_table(int page_number) {
-    Page_table_entry* current = page_table;
-    while (current != NULL) {
-        if (current->page_number == page_number) {
-            return current;
+void obterPagina(int enderecoLogico) {
+    int deslocamento = enderecoLogico & 0xFF;
+    int numeroPagina = enderecoLogico >> 8;
+
+    int numeroQuadro = -1;
+    bool acertoTLB = false;
+    int indiceTLB = -1;
+
+    for (int i = 0; i < TAMANHO_TLB; i++) {
+        if (TLBPaginas[i] == numeroPagina) {
+            numeroQuadro = TLBQuadros[i];
+            totalAcertosTLB++;
+            acertoTLB = true;
+            indiceTLB = i;
+            break;
         }
-        current = current->next;
     }
-    return NULL;
-}
 
-void enqueue_frame(int frame_number) {
-    FrameQueueNode* new_node = (FrameQueueNode*)malloc(sizeof(FrameQueueNode));
-    new_node->frame_number = frame_number;
-    new_node->next = NULL;
-    if (frame_queue_rear == NULL) {
-        frame_queue_front = frame_queue_rear = new_node;
-    } else {
-        frame_queue_rear->next = new_node;
-        frame_queue_rear = new_node;
-    }
-    frame_queue_size++;
-}
-
-int dequeue_frame() {
-    if (frame_queue_front == NULL) {
-        return -1; // Fila está vazia
-    }
-    int frame_number = frame_queue_front->frame_number;
-    FrameQueueNode* temp = frame_queue_front;
-    frame_queue_front = frame_queue_front->next;
-    if (frame_queue_front == NULL) {
-        frame_queue_rear = NULL;
-    }
-    free(temp);
-    frame_queue_size--;
-    return frame_number;
-}
-
-int add_to_page_table(int page_number) {
-    int frame_number;
-    if (next_free_frame < PAGE_TABLE_SIZE) {
-        frame_number = next_free_frame++;
-    } else {
-        frame_number = dequeue_frame();
-        Page_table_entry* current = page_table;
-        Page_table_entry* prev = NULL;
-        while (current != NULL) {
-            if (current->frame_number == frame_number) {
-                if (prev == NULL) {
-                    page_table = current->next;
-                } else {
-                    prev->next = current->next;
-                }
-                free(current);
-                break;
+    if (numeroQuadro == -1) {
+        if (tabelaPaginas[numeroPagina] != -1) {
+            numeroQuadro = tabelaPaginas[numeroPagina];
+        } else {
+            if (usarFIFO) {
+                tratarFaltaPaginaFIFO(numeroPagina);
+            } else if (usarLRU) {
+                tratarFaltaPaginaLRU(numeroPagina);
             }
-            prev = current;
-            current = current->next;
+
+            totalFaltasPagina++;
+            numeroQuadro = tabelaPaginas[numeroPagina];
         }
     }
 
-    Page_table_entry* new_entry = (Page_table_entry*)malloc(sizeof(Page_table_entry));
-    new_entry->page_number = page_number;
-    new_entry->frame_number = frame_number;
-    new_entry->next = page_table;
-    page_table = new_entry;
+    if (!acertoTLB) {
+        inserirNaTLB(numeroPagina, numeroQuadro);
+        indiceTLB = totalEntradasTLB - 1;
+    }
 
-    page_fault_count++;
-    enqueue_frame(frame_number);
-    return new_entry->frame_number;
+    valorLido = memoriaFisica[numeroQuadro][deslocamento];
+
+    contadorGlobalTempo++;
+    tempoQuadros[numeroQuadro] = contadorGlobalTempo;
+
+    fprintf(arquivoSaida, "Virtual address: %d TLB: %d Physical address: %d Value: %d\n", enderecoLogico, indiceTLB, (numeroQuadro << 8) | deslocamento, valorLido);
+}
+
+void inserirNaTLB(int numeroPagina, int numeroQuadro) {
+    for (int i = 0; i < TAMANHO_TLB; i++) {
+        if (TLBPaginas[i] == numeroPagina) {
+            return;
+        }
+    }
+
+    if (totalEntradasTLB >= TAMANHO_TLB) {
+        totalEntradasTLB = 0;
+    }
+
+    TLBPaginas[totalEntradasTLB] = numeroPagina;
+    TLBQuadros[totalEntradasTLB] = numeroQuadro;
+    totalEntradasTLB++;
+}
+
+void tratarFaltaPaginaFIFO(int numeroPagina) {
+    fseek(arquivoArmazenamento, numeroPagina * TAMANHO_PAGINA, SEEK_SET);
+    fread(bufferArmazenamento, sizeof(signed char), TAMANHO_PAGINA, arquivoArmazenamento);
+
+    if (proximoQuadroDisponivel >= NUMERO_QUADROS) {
+        proximoQuadroDisponivel = 0;
+    }
+
+    for (int i = 0; i < TAMANHO_PAGINA; i++) {
+        memoriaFisica[proximoQuadroDisponivel][i] = bufferArmazenamento[i];
+    }
+
+    for (int i = 0; i < TAMANHO_TABELA_PAGINAS; i++) {
+        if (tabelaPaginas[i] == proximoQuadroDisponivel) {
+            tabelaPaginas[i] = -1;
+        }
+    }
+
+    tabelaPaginas[numeroPagina] = proximoQuadroDisponivel;
+    proximoQuadroDisponivel++;
+}
+
+void tratarFaltaPaginaLRU(int numeroPagina) {
+    fseek(arquivoArmazenamento, numeroPagina * TAMANHO_PAGINA, SEEK_SET);
+    fread(bufferArmazenamento, sizeof(signed char), TAMANHO_PAGINA, arquivoArmazenamento);
+
+    if (primeiroNumeroTabelaPaginasDisponivel >= NUMERO_QUADROS) {
+        proximoQuadroDisponivel = encontrarQuadroLRU(tempoQuadros, NUMERO_QUADROS);
+    }
+
+    for (int i = 0; i < TAMANHO_PAGINA; i++) {
+        memoriaFisica[proximoQuadroDisponivel][i] = bufferArmazenamento[i];
+    }
+
+    for (int i = 0; i < TAMANHO_TABELA_PAGINAS; i++) {
+        if (tabelaPaginas[i] == proximoQuadroDisponivel) {
+            tabelaPaginas[i] = -1;
+        }
+    }
+
+    tabelaPaginas[numeroPagina] = proximoQuadroDisponivel;
+    if (proximoQuadroDisponivel < NUMERO_QUADROS) {
+        proximoQuadroDisponivel++;
+    }
+    primeiroNumeroTabelaPaginasDisponivel++;
 }
 
 int main(int argc, char *argv[]) {
-
-    FILE *addresses_file = fopen(argv[1], "r");
-
-    backing_store = fopen("BACKING_STORE.bin", "rb");
-
-    FILE *output_file = fopen("correct.txt", "w");
-    
-    initialize();
-
-    char address[10];
-    while (fgets(address, 10, addresses_file) != NULL) {
-        int logical_address = atoi(address);
-        int page_number = (logical_address >> 8) & 0xFF;
-        int offset = logical_address & 0xFF;
-
-        int tlb_entry_index = search_tlb(page_number);
-        int frame_number;
-        if (tlb_entry_index != -1) {
-            frame_number = tlb[tlb_entry_index].frame_number;
-        } else {
-            Page_table_entry* page_table_entry = search_page_table(page_number);
-            if (page_table_entry != NULL) {
-                frame_number = page_table_entry->frame_number;
-            } else {
-                frame_number = add_to_page_table(page_number);
-
-                fseek(backing_store, page_number * PAGE_SIZE, SEEK_SET);
-                fread(&memory[frame_number * PAGE_SIZE], sizeof(char), PAGE_SIZE, backing_store);
-            }
-            add_to_tlb(page_number, frame_number);
-            tlb_entry_index = (tlb_index - 1 + TLB_SIZE) % TLB_SIZE;
-        }
-
-        int physical_address = frame_number * PAGE_SIZE + offset;
-        signed char value = memory[physical_address];
-
-        fprintf(output_file, "Virtual address: %d TLB: %d Physical address: %d Value: %d \n",
-                logical_address, tlb_entry_index, physical_address, value);
-        total_addresses++;
+    for (int i = 0; i < 5000; i++) {
+        valorpaginas[i] = -1;
+    }
+    if (argc != 3) {
+        fprintf(stderr, "./vm [local.txt] [fifo/lru]\n");
+        return -1;
     }
 
-    fprintf(output_file, "Number of Translated Addresses = %d\n", total_addresses);
-    fprintf(output_file, "Page Faults = %d\n", page_fault_count);
-    fprintf(output_file, "Page Fault Rate = %.3f\n", (float) page_fault_count / total_addresses);
-    fprintf(output_file, "TLB Hits = %d\n", tlb_hit_count);
-    fprintf(output_file, "TLB Hit Rate = %.3f\n", (float) tlb_hit_count / total_addresses);
+    if (strcmp(argv[2], "fifo") == 0) {
+        usarFIFO = true;
+    } else if (strcmp(argv[2], "lru") == 0) {
+        usarLRU = true;
+    }
 
-    fclose(addresses_file);
-    fclose(backing_store);
-    fclose(output_file);
+    arquivoArmazenamento = fopen("BACKING_STORE.bin", "rb");
+    if (arquivoArmazenamento == NULL) {
+        fprintf(stderr, "Error opening backing store file\n");
+        return -1;
+    }
+
+    arquivoEnderecos = fopen(argv[1], "r");
+    if (arquivoEnderecos == NULL) {
+        fprintf(stderr, "Error opening address file\n");
+        return -1;
+    }
+
+    arquivoSaida = fopen("correct.txt", "w+");
+    if (arquivoSaida == NULL) {
+        fprintf(stderr, "Error opening output file\n");
+        return -1;
+    }
+
+    inicializarEstruturas();
+
+    int totalEnderecosTraduzidos = 0;
+    while (fgets(enderecoStr, TAMANHO_ENDERECO, arquivoEnderecos) != NULL) {
+        enderecoLogico = atoi(enderecoStr);
+        obterPagina(enderecoLogico);
+        totalEnderecosTraduzidos++;
+    }
+
+    fprintf(arquivoSaida, "Number of Translated Addresses = %d\n", totalEnderecosTraduzidos);
+    double taxaFaltasPagina = (double) totalFaltasPagina / totalEnderecosTraduzidos;
+    double taxaAcertosTLB = (double) totalAcertosTLB / totalEnderecosTraduzidos;
+
+    fprintf(arquivoSaida, "Page Faults = %d\n", totalFaltasPagina);
+    fprintf(arquivoSaida, "Page Fault Rate = %.3f\n", taxaFaltasPagina);
+    fprintf(arquivoSaida, "TLB Hits = %d\n", totalAcertosTLB);
+    fprintf(arquivoSaida, "TLB Hit Rate = %.3f\n", taxaAcertosTLB);
+
+    fclose(arquivoEnderecos);
+    fclose(arquivoArmazenamento);
+    fclose(arquivoSaida);
 
     return 0;
 }
